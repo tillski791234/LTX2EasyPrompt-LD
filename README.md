@@ -1,3 +1,9 @@
+Added Support for GGUF via llama.cpp-python and OpenAI-Style API via http on external qwen3.5 Servers like llama-server.
+Added language switch for several languages for auto created dialogs.
+
+Install llama.cpp-python in your venv for local GGUF-support.
+I recommend hauhau qwen3.5 abliberated in Q4 or Q6
+
 <img width="1990" height="1076" alt="Screenshot 2026-03-17 220714" src="https://github.com/user-attachments/assets/3008f7a2-38e8-46bb-9dd3-3893a33b22f5" />
 <img width="1739" height="911" alt="Screenshot 2026-03-17 220917" src="https://github.com/user-attachments/assets/6a2cefae-2685-4121-aa5e-e26a221db160" />
 <img width="1707" height="785" alt="Screenshot 2026-03-17 220903" src="https://github.com/user-attachments/assets/804c1948-f75c-4518-ad94-7325b8fb1d92" />
