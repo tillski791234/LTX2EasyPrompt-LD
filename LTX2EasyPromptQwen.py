@@ -5,6 +5,8 @@ import random
 import time as _time
 import sys
 import subprocess
+import urllib.request
+import urllib.error
 
 # ── Node directory path — ensures lyric_phrase_bank.py is always importable ──
 # ComfyUI may not add the custom node's directory to sys.path automatically.
@@ -59,6 +61,53 @@ _check_and_upgrade_transformers()
 import torch
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+def _resolve_model_target(gpu_id: int):
+    if not torch.cuda.is_available():
+        return "cpu"
+    if gpu_id is None or gpu_id < 0:
+        return "auto"
+    cuda_count = torch.cuda.device_count()
+    if gpu_id >= cuda_count:
+        fallback_idx = torch.cuda.current_device()
+        print(
+            f"[LTX2-Qwen] Requested GPU {gpu_id} is unavailable. "
+            f"Falling back to cuda:{fallback_idx}."
+        )
+        return f"cuda:{fallback_idx}"
+    return f"cuda:{gpu_id}"
+
+
+def _get_torch_dtype_for_target(target_device: str):
+    if target_device == "cpu" or not torch.cuda.is_available():
+        return torch.float32
+    if target_device == "auto":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    try:
+        gpu_index = int(str(target_device).split(":")[-1])
+        major, _minor = torch.cuda.get_device_capability(gpu_index)
+        if major >= 8:
+            return torch.bfloat16
+    except Exception as e:
+        print(f"[LTX2-Qwen] Could not inspect {target_device} capability: {e}")
+    return torch.float16
+
+
+def _build_model_load_kwargs(target_device: str, offline_mode: bool, dtype):
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+        "local_files_only": offline_mode,
+    }
+    if target_device == "cpu":
+        load_kwargs["device_map"] = "cpu"
+    elif target_device == "auto":
+        load_kwargs["device_map"] = "auto"
+    else:
+        load_kwargs["device_map"] = None
+        load_kwargs["low_cpu_mem_usage"] = False
+    return load_kwargs
 
 
 # ── Audio analysis ────────────────────────────────────────────────────────────
@@ -2120,6 +2169,23 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                     "default": "None — let the LLM decide",
                     "tooltip": "Sets the full visual aesthetic — lighting, camera style, colour grade, mood. Also sets smart defaults for shot angle and camera movement automatically.",
                 }),
+                "🗣 spoken language": ([
+                    "Auto — use existing prompt logic",
+                    "English",
+                    "German",
+                    "French",
+                    "Spanish",
+                    "Italian",
+                    "Portuguese",
+                    "Polish",
+                    "Russian",
+                    "Japanese",
+                    "Korean",
+                    "Chinese",
+                ], {
+                    "default": "Auto — use existing prompt logic",
+                    "tooltip": "Controls only spoken or sung in-scene language. The descriptive prompt prose stays in English."
+                }),
                 "🌍 environment": (list(LTX2PromptArchitectQwen.ENVIRONMENT_PRESETS.keys()), {
                     "default": "None — LLM decides",
                     "tooltip": "Force a specific location and environment. Overrides any location in your prompt. Explicit locations (casting couch, sex dungeon etc) only inject when scene content is explicit or sensual.",
@@ -2280,15 +2346,72 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                         ),
                     }
                 ),
+                "🧩 backend": (
+                    ["transformers", "llama.cpp (GGUF)", "llama-server (OpenAI API)"],
+                    {
+                        "default": "transformers",
+                        "tooltip": "Choose the inference backend. Transformers uses HuggingFace checkpoints. llama.cpp loads a GGUF via llama-cpp-python. llama-server sends requests to a running external server."
+                    }
+                ),
                 "📁 local model path": ("STRING", {
                     "default": "",
                     "multiline": False,
                     "placeholder": "Full path to Huihui-Qwen3.5-9B snapshot folder",
                     "tooltip": "Optional. Paste the full path to your locally downloaded model snapshot folder. Leave blank to auto-download from HuggingFace on first run.",
                 }),
+                "🦙 gguf repo": ("STRING", {
+                    "default": "lukey03/Qwen3.5-9B-abliterated-GGUF",
+                    "multiline": False,
+                    "placeholder": "repo/name",
+                    "tooltip": "llama.cpp only. Hugging Face repo ID containing the GGUF file."
+                }),
+                "🦙 gguf file": ("STRING", {
+                    "default": "Qwen3.5-9B-abliterated-Q4_K_M.gguf",
+                    "multiline": False,
+                    "placeholder": "model.gguf",
+                    "tooltip": "llama.cpp only. Exact GGUF filename to download from the selected repo."
+                }),
+                "🦙 n_gpu_layers": ("INT", {
+                    "default": -1, "min": -1, "max": 512, "step": 1,
+                    "display": "number",
+                    "tooltip": "llama.cpp only. -1 offloads as many layers as possible, 0 keeps everything on CPU."
+                }),
+                "🦙 context size": ("INT", {
+                    "default": 8192, "min": 512, "max": 65536, "step": 256,
+                    "display": "number",
+                    "tooltip": "llama.cpp only. Context size for llama.cpp."
+                }),
+                "🦙 batch size": ("INT", {
+                    "default": 512, "min": 32, "max": 8192, "step": 32,
+                    "display": "number",
+                    "tooltip": "llama.cpp only. Prompt processing batch size."
+                }),
+                "🌐 llama-server url": ("STRING", {
+                    "default": "http://127.0.0.1:8080/v1",
+                    "multiline": False,
+                    "placeholder": "http://127.0.0.1:8080/v1",
+                    "tooltip": "llama-server only. Base URL of the external OpenAI-compatible llama.cpp server."
+                }),
+                "🌐 llama-server model": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "optional model name",
+                    "tooltip": "llama-server only. Optional model field sent in the chat completion request."
+                }),
+                "🔑 llama-server api key": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "optional bearer token",
+                    "tooltip": "llama-server only. Optional bearer token for authenticated servers."
+                }),
                 "✈ offline mode": ("BOOLEAN", {
                     "default": False,
                     "tooltip": "Turn ON if you have no internet. Uses locally cached models only. Turn OFF to allow auto-download from HuggingFace on first run.",
+                }),
+                "🧠 GPU ID": ("INT", {
+                    "default": -1, "min": -1, "max": 15, "step": 1,
+                    "display": "number",
+                    "tooltip": "-1 = automatic device selection. 0/1/2/... pins the model to a specific CUDA GPU for transformers and llama.cpp."
                 }),
                 "🔗 keep model loaded": ("BOOLEAN", {
                     "default": False,
@@ -2315,22 +2438,173 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         self._last_portrait        = False
         self._last_style           = ""
         self._resolved_model_path  = None  # cached after first snapshot_download — avoids HF API call every run
+        self._resolved_gguf_path   = None
+        self._resolved_gguf_key    = None
+        self._loaded_backend       = None
+        self._loaded_model_id      = None
+        self._loaded_device_target = None
+        self._loaded_llama_config  = None
+        self._loaded_server_config = None
 
     # ── Model management ──────────────────────────────────────────────────────
 
-    def load_model(self, offline_mode: bool, local_path: str, model_id: str = None):
+    def load_model(
+        self,
+        offline_mode: bool,
+        local_path: str,
+        model_id: str = None,
+        backend: str = "transformers",
+        gpu_id: int = -1,
+        gguf_repo_id: str = "",
+        gguf_filename: str = "",
+        llama_n_gpu_layers: int = -1,
+        llama_n_ctx: int = 8192,
+        llama_n_batch: int = 512,
+        llama_server_url: str = "",
+        llama_server_model: str = "",
+        llama_server_api_key: str = "",
+    ):
         # Use selected model ID or fall back to class default
         _active_model_id = (model_id or self.MODEL_HF_ID).strip()
         if not _active_model_id:
             _active_model_id = self.MODEL_HF_ID
+        backend = (backend or "transformers").strip()
+        target_device = _resolve_model_target(gpu_id)
 
-        # Unload if a different model is requested mid-session
+        if backend == "llama-server (OpenAI API)":
+            server_url = (llama_server_url or "http://127.0.0.1:8080/v1").rstrip("/")
+            server_config = {
+                "url": server_url,
+                "model": (llama_server_model or "").strip(),
+                "api_key": (llama_server_api_key or "").strip(),
+            }
+            if self.model is not None and self._loaded_backend == backend:
+                if self._loaded_server_config == server_config:
+                    return
+                print("[LTX2-Qwen] llama-server config changed. Reloading...")
+                self.unload_model()
+            elif self.model is not None:
+                self.unload_model()
+
+            self.model = server_config
+            self.tokenizer = None
+            self.loaded = True
+            self._stop_token_ids = []
+            self._loaded_backend = backend
+            self._loaded_server_config = dict(server_config)
+            self._loaded_llama_config = None
+            self._loaded_model_id = None
+            self._loaded_device_target = None
+            print(f"[LTX2-Qwen] Ready: llama-server at {server_url}")
+            return
+
+        if backend == "llama.cpp (GGUF)":
+            gguf_repo_id = (gguf_repo_id or "").strip()
+            gguf_filename = (gguf_filename or "").strip()
+            if not gguf_repo_id or not gguf_filename:
+                raise RuntimeError("[LTX2-Qwen] llama.cpp backend requires both '🦙 gguf repo' and '🦙 gguf file'.")
+
+            gguf_key = f"{gguf_repo_id}/{gguf_filename}"
+            gguf_config = {
+                "repo_id": gguf_repo_id,
+                "filename": gguf_filename,
+                "target_device": target_device,
+                "n_gpu_layers": int(llama_n_gpu_layers),
+                "n_ctx": int(llama_n_ctx),
+                "n_batch": int(llama_n_batch),
+            }
+
+            if self.model is not None and self._loaded_backend == backend:
+                if self._loaded_llama_config == gguf_config:
+                    return
+                print("[LTX2-Qwen] GGUF config changed. Reloading...")
+                self.unload_model()
+            elif self.model is not None:
+                self.unload_model()
+
+            if self._resolved_gguf_key == gguf_key and self._resolved_gguf_path:
+                source = self._resolved_gguf_path
+                print(f"[LTX2-Qwen] Using cached GGUF path: {source}")
+            else:
+                try:
+                    from huggingface_hub import hf_hub_download
+                    print(f"[LTX2-Qwen] Resolving GGUF model path (first run): {gguf_key}")
+                    source = hf_hub_download(
+                        repo_id=gguf_repo_id,
+                        filename=gguf_filename,
+                        local_files_only=offline_mode,
+                    )
+                except Exception as e:
+                    if offline_mode:
+                        raise RuntimeError(
+                            f"[LTX2-Qwen] Could not resolve GGUF in offline mode: {gguf_key} ({e})"
+                        ) from e
+                    try:
+                        from huggingface_hub import snapshot_download
+                        print(f"[LTX2-Qwen] hf_hub_download failed: {e}. Retrying with snapshot_download for {gguf_filename}...")
+                        snapshot_dir = snapshot_download(
+                            repo_id=gguf_repo_id,
+                            allow_patterns=[gguf_filename],
+                        )
+                        source = os.path.join(snapshot_dir, gguf_filename)
+                    except Exception as snapshot_error:
+                        raise RuntimeError(
+                            f"[LTX2-Qwen] Could not auto-download GGUF model '{gguf_key}': {snapshot_error}"
+                        ) from snapshot_error
+
+                self._resolved_gguf_key = gguf_key
+                self._resolved_gguf_path = source
+                print(f"[LTX2-Qwen] GGUF ready at: {source}")
+
+            try:
+                from llama_cpp import Llama
+            except Exception as e:
+                raise RuntimeError(
+                    "[LTX2-Qwen] llama.cpp backend selected but llama-cpp-python is not installed."
+                ) from e
+
+            llama_kwargs = {
+                "model_path": source,
+                "n_ctx": int(llama_n_ctx),
+                "n_batch": int(llama_n_batch),
+                "n_gpu_layers": int(llama_n_gpu_layers),
+                "verbose": True,
+            }
+            if target_device.startswith("cuda:"):
+                llama_kwargs["main_gpu"] = int(target_device.split(":")[-1])
+            elif target_device == "auto" and torch.cuda.is_available():
+                llama_kwargs["main_gpu"] = torch.cuda.current_device()
+            else:
+                llama_kwargs["n_gpu_layers"] = 0
+
+            print(
+                f"[LTX2-Qwen] Loading GGUF via llama.cpp: path={source}, "
+                f"main_gpu={llama_kwargs.get('main_gpu', 'cpu')}, "
+                f"n_gpu_layers={llama_kwargs['n_gpu_layers']}, "
+                f"n_ctx={llama_kwargs['n_ctx']}, n_batch={llama_kwargs['n_batch']}"
+            )
+            self.model = Llama(**llama_kwargs)
+            self.tokenizer = None
+            self.loaded = True
+            self._stop_token_ids = []
+            self._loaded_backend = backend
+            self._loaded_llama_config = dict(gguf_config)
+            self._loaded_server_config = None
+            self._loaded_model_id = None
+            self._loaded_device_target = target_device
+            print(f"[LTX2-Qwen] Ready: GGUF on {target_device}")
+            return
+
         if self.model is not None:
             _loaded_id = getattr(self, "_loaded_model_id", self.MODEL_HF_ID)
-            if _loaded_id == _active_model_id:
-                return  # same model already loaded, nothing to do
-            print(f"[LTX2-Qwen] Model changed: {_loaded_id} → {_active_model_id}. Reloading...")
-            self._resolved_model_path = None  # clear cached path — new model needs fresh resolution
+            if (
+                self._loaded_backend == backend and
+                _loaded_id == _active_model_id and
+                self._loaded_device_target == target_device
+            ):
+                return
+            print(f"[LTX2-Qwen] Model/backend changed. Reloading...")
+            self._resolved_model_path = None
             self.unload_model()
 
         # Guard: saved workflows may have stored boolean False for this field.
@@ -2342,7 +2616,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
 
         if not source:
             if offline_mode:
-                source = self.MODEL_HF_ID
+                source = _active_model_id
                 print(f"[LTX2-Qwen] Offline mode — will use HF cache only. "
                       f"If model is not already cached this will raise an error: {_active_model_id}")
             elif self._resolved_model_path:
@@ -2365,14 +2639,16 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         self.tokenizer = AutoTokenizer.from_pretrained(
             source, trust_remote_code=True, local_files_only=offline_mode
         )
-        if torch.cuda.is_available():
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        else:
-            dtype = torch.float32  # float16 is not supported on CPU
-        self.model = AutoModelForCausalLM.from_pretrained(
-            source, torch_dtype=dtype, device_map="auto",
-            trust_remote_code=True, local_files_only=offline_mode
+        dtype = _get_torch_dtype_for_target(target_device)
+        load_kwargs = _build_model_load_kwargs(target_device, offline_mode, dtype)
+        print(
+            f"[LTX2-Qwen] Loading transformers model with dtype={dtype} "
+            f"and device_map={load_kwargs.get('device_map')}"
         )
+        self.model = AutoModelForCausalLM.from_pretrained(source, **load_kwargs)
+        if target_device.startswith("cuda:"):
+            print(f"[LTX2-Qwen] Moving transformers model to {target_device}...")
+            self.model.to(target_device)
         self.model.config.use_cache = True
         self.model.eval()
         self.loaded = True
@@ -2381,34 +2657,45 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             a = torch.cuda.memory_allocated() / 1024**3
             r = torch.cuda.memory_reserved()  / 1024**3
             print(f"[LTX2-Qwen] Loaded — VRAM: {a:.2f}GB alloc / {r:.2f}GB reserved")
+        self._loaded_backend = backend
         self._loaded_model_id = _active_model_id
+        self._loaded_device_target = target_device
+        self._loaded_llama_config = None
+        self._loaded_server_config = None
         print(f"[LTX2-Qwen] Ready: {_active_model_id}")
 
     def unload_model(self):
         if self.model is None:
             return
         print("[LTX2-Qwen] Unloading model...")
-        try:
-            for _n, module in list(self.model.named_modules()):
-                for _p, param in list(module.named_parameters(recurse=False)):
-                    try:
-                        param.data = torch.empty(0)
-                    except Exception:
-                        pass
-                for _b, buf in list(module.named_buffers(recurse=False)):
-                    try:
-                        module._buffers[_b] = None
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"[LTX2-Qwen] Tensor destroy warning: {e}")
+        if self._loaded_backend == "transformers":
+            try:
+                for _n, module in list(self.model.named_modules()):
+                    for _p, param in list(module.named_parameters(recurse=False)):
+                        try:
+                            param.data = torch.empty(0)
+                        except Exception:
+                            pass
+                    for _b, buf in list(module.named_buffers(recurse=False)):
+                        try:
+                            module._buffers[_b] = None
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[LTX2-Qwen] Tensor destroy warning: {e}")
 
         del self.model
-        del self.tokenizer
+        if self.tokenizer is not None:
+            del self.tokenizer
         self.model           = None
         self.tokenizer       = None
         self.loaded          = False
         self._stop_token_ids = []
+        self._loaded_backend = None
+        self._loaded_model_id = None
+        self._loaded_device_target = None
+        self._loaded_llama_config = None
+        self._loaded_server_config = None
 
         gc.collect()
         if torch.cuda.is_available():
@@ -2697,6 +2984,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         shot_angle            = kwargs.get("📐 shot angle",                 "None — LLM decides")
         camera_movement       = kwargs.get("🎥 camera movement",            "None — LLM decides")
         style_preset          = kwargs.get("🎬 style preset",               "None — let the LLM decide")
+        spoken_language_sel   = kwargs.get("🗣 spoken language",            "Auto — use existing prompt logic")
         seed                  = kwargs.get("seed",                          -1)
         control_after_generate = kwargs.get("control_after_generate",       "randomize")
         # ── Unpack optional inputs ────────────────────────────────────────────
@@ -2712,8 +3000,18 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         frame_count           = kwargs.get("⏱ frame count",                 192)
         width                 = kwargs.get("↔ width",                       0)
         height                = kwargs.get("↕ height",                      0)
+        backend               = kwargs.get("🧩 backend",                    "transformers")
         local_path            = kwargs.get("📁 local model path",            "")
+        gguf_repo_id          = kwargs.get("🦙 gguf repo",                   "lukey03/Qwen3.5-9B-abliterated-GGUF")
+        gguf_filename         = kwargs.get("🦙 gguf file",                   "Qwen3.5-9B-abliterated-Q4_K_M.gguf")
+        llama_n_gpu_layers    = kwargs.get("🦙 n_gpu_layers",                -1)
+        llama_n_ctx           = kwargs.get("🦙 context size",                8192)
+        llama_n_batch         = kwargs.get("🦙 batch size",                  512)
+        llama_server_url      = kwargs.get("🌐 llama-server url",            "http://127.0.0.1:8080/v1")
+        llama_server_model    = kwargs.get("🌐 llama-server model",          "")
+        llama_server_api_key  = kwargs.get("🔑 llama-server api key",        "")
         offline_mode          = kwargs.get("✈ offline mode",                False)
+        gpu_id                = kwargs.get("🧠 GPU ID",                      -1)
         selected_model        = kwargs.get("🤖 model",                         "huihui-ai/Huihui-Qwen3.5-9B-abliterated")
         keep_model_loaded     = kwargs.get("🔗 keep model loaded",           False)
         scene_context         = kwargs.get("🖼 scene context",               "")
@@ -2744,7 +3042,21 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             r = torch.cuda.memory_reserved()  / 1024**3
             print(f"[LTX2-Qwen] Pre-run VRAM: {a:.2f}GB alloc / {r:.2f}GB reserved")
 
-        self.load_model(offline_mode=offline_mode, local_path=local_path, model_id=selected_model)
+        self.load_model(
+            offline_mode=offline_mode,
+            local_path=local_path,
+            model_id=selected_model,
+            backend=backend,
+            gpu_id=gpu_id,
+            gguf_repo_id=gguf_repo_id,
+            gguf_filename=gguf_filename,
+            llama_n_gpu_layers=llama_n_gpu_layers,
+            llama_n_ctx=llama_n_ctx,
+            llama_n_batch=llama_n_batch,
+            llama_server_url=llama_server_url,
+            llama_server_model=llama_server_model,
+            llama_server_api_key=llama_server_api_key,
+        )
 
         # ── Style preset ──────────────────────────────────────────────────────
         preset_data            = self.STYLE_PRESETS.get(style_preset, ("", False))
@@ -8616,7 +8928,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                     + ". These details are NOT optional suggestions — they define the world "
                     "this scene inhabits. Apply them unless the user has explicitly overridden them.]"
                 )
-                print(f"[LTX2-Qwen] Genre world: {" | ".join(_world_parts)}")
+                print(f"[LTX2-Qwen] Genre world: {' | '.join(_world_parts)}")
 
 
         # ── Environment pool ──────────────────────────────────────────────────
@@ -9029,6 +9341,17 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             "Nothing removed that the user did describe.]"
         )
 
+        spoken_language_instruction = ""
+        if spoken_language_sel and spoken_language_sel != "Auto — use existing prompt logic":
+            spoken_language_instruction = (
+                f"\n[SPOKEN CONTENT LANGUAGE — HARD REQUIREMENT: "
+                f"Any spoken dialogue, sung lyrics, whispers, moans, chants, or other vocalised words "
+                f"must be in {spoken_language_sel}. "
+                f"The descriptive prompt prose itself must remain in English. "
+                f"Do not switch the full prompt narration to {spoken_language_sel}; "
+                f"only in-scene spoken or sung content changes language.]"
+            )
+
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user",   "content": (
@@ -9056,6 +9379,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                 + _env_instruction
                 + explicit_instruction
                 + dialogue_instruction
+                + spoken_language_instruction
                 + lift_instruction
                 + _exertion_instruction
                 + action_sequence_instruction
@@ -9064,53 +9388,86 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             )},
         ]
 
-        # ── Tokenise ──────────────────────────────────────────────────────────
-        try:
-            raw = self.tokenizer.apply_chat_template(
-                messages, return_tensors="pt",
-                add_generation_prompt=True, enable_thinking=False
-            )
-        except TypeError:
-            # enable_thinking not supported by this tokenizer version — retry without it
-            print("[LTX2-Qwen] enable_thinking kwarg not supported — retrying without it")
-            raw = self.tokenizer.apply_chat_template(
-                messages, return_tensors="pt",
-                add_generation_prompt=True
-            )
-        if hasattr(raw, "input_ids"):
-            input_ids = raw.input_ids.to(self.model.device)
-        elif isinstance(raw, dict):
-            input_ids = raw["input_ids"].to(self.model.device)
-        elif isinstance(raw, list):
-            input_ids = torch.tensor([raw], dtype=torch.long).to(self.model.device)
-        else:
-            input_ids = raw.to(self.model.device)
-        input_length = input_ids.shape[1]
-
         # ── Generate ──────────────────────────────────────────────────────────
         try:
-            with torch.no_grad():
-                output_ids = self.model.generate(
-                    input_ids,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    do_sample=True,
-                    top_k=20,
-                    top_p=0.82,
-                    min_p=0.0,
-                    repetition_penalty=1.05,
-                    use_cache=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self._stop_token_ids
+            if backend == "transformers":
+                raw = self.tokenizer.apply_chat_template(
+                    messages, return_tensors="pt",
+                    add_generation_prompt=True
                 )
+                if hasattr(raw, "input_ids"):
+                    input_ids = raw.input_ids.to(self.model.device)
+                elif isinstance(raw, dict):
+                    input_ids = raw["input_ids"].to(self.model.device)
+                elif isinstance(raw, list):
+                    input_ids = torch.tensor([raw], dtype=torch.long).to(self.model.device)
+                else:
+                    input_ids = raw.to(self.model.device)
+                input_length = input_ids.shape[1]
+
+                with torch.no_grad():
+                    output_ids = self.model.generate(
+                        input_ids,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        do_sample=True,
+                        top_k=20,
+                        top_p=0.82,
+                        min_p=0.0,
+                        repetition_penalty=1.05,
+                        use_cache=True,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                        eos_token_id=self._stop_token_ids
+                    )
+
+                result = self.tokenizer.decode(output_ids[0][input_length:], skip_special_tokens=True).strip()
+                del output_ids, input_ids
+                gc.collect()
+
+            elif backend == "llama.cpp (GGUF)":
+                response = self.model.create_chat_completion(
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=0.82,
+                    top_k=20,
+                    min_p=0.0,
+                    repeat_penalty=1.05,
+                    max_tokens=max_tokens,
+                )
+                result = response["choices"][0]["message"]["content"].strip()
+
+            elif backend == "llama-server (OpenAI API)":
+                base_url = (self.model.get("url") or "http://127.0.0.1:8080/v1").rstrip("/")
+                endpoint = base_url + "/chat/completions"
+                payload = {
+                    "messages": messages,
+                    "temperature": temperature,
+                    "top_p": 0.82,
+                    "max_tokens": max_tokens,
+                }
+                if self.model.get("model"):
+                    payload["model"] = self.model["model"]
+
+                request = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                if self.model.get("api_key"):
+                    request.add_header("Authorization", f"Bearer {self.model['api_key']}")
+
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    body = response.read().decode("utf-8")
+                decoded = json.loads(body)
+                result = decoded["choices"][0]["message"]["content"].strip()
+
+            else:
+                raise RuntimeError(f"[LTX2-Qwen] Unsupported backend: {backend}")
         except Exception as e:
             print(f"[LTX2-Qwen] Generation error: {e}")
             self.unload_model()
             raise
-
-        result = self.tokenizer.decode(output_ids[0][input_length:], skip_special_tokens=True).strip()
-        del output_ids, input_ids
-        gc.collect()
 
         if not result or not result.strip():
             print("[LTX2-Qwen] Warning: empty generation — returning user input as fallback")
