@@ -64,6 +64,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def _resolve_model_target(gpu_id: int):
+    try:
+        if isinstance(gpu_id, str):
+            gpu_id = gpu_id.strip()
+            gpu_id = int(gpu_id) if gpu_id else -1
+    except Exception:
+        gpu_id = -1
     if not torch.cuda.is_available():
         return "cpu"
     if gpu_id is None or gpu_id < 0:
@@ -2347,10 +2353,10 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                     }
                 ),
                 "🧩 backend": (
-                    ["transformers", "llama.cpp (GGUF)", "llama-server (OpenAI API)"],
+                    ["transformers", "llama.cpp (GGUF)", "openai compatible server"],
                     {
                         "default": "transformers",
-                        "tooltip": "Choose the inference backend. Transformers uses HuggingFace checkpoints. llama.cpp loads a GGUF via llama-cpp-python. llama-server sends requests to a running external server."
+                        "tooltip": "Choose the inference backend. Transformers uses HuggingFace checkpoints. llama.cpp loads a GGUF via llama-cpp-python. The server backend sends OpenAI-compatible chat requests to an external endpoint."
                     }
                 ),
                 "📁 local model path": ("STRING", {
@@ -2386,23 +2392,23 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                     "display": "number",
                     "tooltip": "llama.cpp only. Prompt processing batch size."
                 }),
-                "🌐 llama-server url": ("STRING", {
+                "🌐 server url": ("STRING", {
                     "default": "http://127.0.0.1:8080/v1",
                     "multiline": False,
                     "placeholder": "http://127.0.0.1:8080/v1",
-                    "tooltip": "llama-server only. Base URL of the external OpenAI-compatible llama.cpp server."
+                    "tooltip": "Server backend only. Base URL of the external OpenAI-compatible endpoint."
                 }),
-                "🌐 llama-server model": ("STRING", {
+                "🌐 server model": ("STRING", {
                     "default": "",
                     "multiline": False,
                     "placeholder": "optional model name",
-                    "tooltip": "llama-server only. Optional model field sent in the chat completion request."
+                    "tooltip": "Server backend only. Optional model field sent in the chat completion request."
                 }),
-                "🔑 llama-server api key": ("STRING", {
+                "🔑 server api key": ("STRING", {
                     "default": "",
                     "multiline": False,
                     "placeholder": "optional bearer token",
-                    "tooltip": "llama-server only. Optional bearer token for authenticated servers."
+                    "tooltip": "Server backend only. Optional bearer token for authenticated OpenAI-compatible endpoints."
                 }),
                 "✈ offline mode": ("BOOLEAN", {
                     "default": False,
@@ -2471,7 +2477,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         backend = (backend or "transformers").strip()
         target_device = _resolve_model_target(gpu_id)
 
-        if backend == "llama-server (OpenAI API)":
+        if backend == "openai compatible server":
             server_url = (llama_server_url or "http://127.0.0.1:8080/v1").rstrip("/")
             server_config = {
                 "url": server_url,
@@ -2481,7 +2487,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             if self.model is not None and self._loaded_backend == backend:
                 if self._loaded_server_config == server_config:
                     return
-                print("[LTX2-Qwen] llama-server config changed. Reloading...")
+                print("[LTX2-Qwen] Server config changed. Reloading...")
                 self.unload_model()
             elif self.model is not None:
                 self.unload_model()
@@ -2495,7 +2501,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
             self._loaded_llama_config = None
             self._loaded_model_id = None
             self._loaded_device_target = None
-            print(f"[LTX2-Qwen] Ready: llama-server at {server_url}")
+            print(f"[LTX2-Qwen] Ready: OpenAI-compatible server at {server_url}")
             return
 
         if backend == "llama.cpp (GGUF)":
@@ -3007,9 +3013,9 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
         llama_n_gpu_layers    = kwargs.get("🦙 n_gpu_layers",                -1)
         llama_n_ctx           = kwargs.get("🦙 context size",                8192)
         llama_n_batch         = kwargs.get("🦙 batch size",                  512)
-        llama_server_url      = kwargs.get("🌐 llama-server url",            "http://127.0.0.1:8080/v1")
-        llama_server_model    = kwargs.get("🌐 llama-server model",          "")
-        llama_server_api_key  = kwargs.get("🔑 llama-server api key",        "")
+        llama_server_url      = kwargs.get("🌐 server url",                  kwargs.get("🌐 llama-server url", "http://127.0.0.1:8080/v1"))
+        llama_server_model    = kwargs.get("🌐 server model",                kwargs.get("🌐 llama-server model", ""))
+        llama_server_api_key  = kwargs.get("🔑 server api key",              kwargs.get("🔑 llama-server api key", ""))
         offline_mode          = kwargs.get("✈ offline mode",                False)
         gpu_id                = kwargs.get("🧠 GPU ID",                      -1)
         selected_model        = kwargs.get("🤖 model",                         "huihui-ai/Huihui-Qwen3.5-9B-abliterated")
@@ -5260,7 +5266,11 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
 
         # ── Assemble music sound rule ──────────────────────────────────────
         if has_music and _detected_entry:
-            _gbr, _gbm, _gins, _gen, _glocs, _gmv, _gcs, _gclothing = _detected_entry
+            if len(_detected_entry) == 7:
+                _gbr, _gbm, _gins, _gen, _glocs, _gmv, _gcs = _detected_entry
+                _gclothing = ""
+            else:
+                _gbr, _gbm, _gins, _gen, _glocs, _gmv, _gcs, _gclothing = _detected_entry
 
             # BPM guidance
             if _resolved_bpm:
@@ -9436,7 +9446,7 @@ Output ONLY the prompt. No preamble, no "Sure!", no "Here's your prompt:", no co
                 )
                 result = response["choices"][0]["message"]["content"].strip()
 
-            elif backend == "llama-server (OpenAI API)":
+            elif backend == "openai compatible server":
                 base_url = (self.model.get("url") or "http://127.0.0.1:8080/v1").rstrip("/")
                 endpoint = base_url + "/chat/completions"
                 payload = {
